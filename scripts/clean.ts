@@ -1,0 +1,224 @@
+/**
+ * Database cleanup utility - deletes all data from all tables or drops them entirely
+ *
+ * Handles foreign key constraints by disabling them during deletion.
+ * Always resets autoincrement sequences when they exist.
+ *
+ * Options:
+ *   --confirm         Skip confirmation prompt (use in scripts)
+ *   --tables=t1,t2    Only delete from specified tables
+ *   --dry-run         Show what would be deleted without actually deleting
+ *   --drop            Drop tables entirely instead of just deleting data
+ *
+ * Examples:
+ *   bun run ./scripts/clean.ts --confirm
+ *   bun run ./scripts/clean.ts --tables=accounts,transactions
+ *   bun run ./scripts/clean.ts --dry-run
+ *   bun run ./scripts/clean.ts --drop --confirm
+ *   bun run ./scripts/clean.ts --drop --tables=old_table --confirm
+ */
+
+import { parseArgs } from 'node:util';
+
+import { sql } from 'drizzle-orm';
+
+import { db } from '@/lib/db/client';
+
+interface TableInfo {
+  name: string;
+}
+
+// Parse command line arguments
+const { values } = parseArgs({
+  args: Bun.argv,
+  options: {
+    confirm: { type: 'boolean', default: false },
+    tables: { type: 'string' },
+    'dry-run': { type: 'boolean', default: false },
+    drop: { type: 'boolean', default: false },
+  },
+  strict: true,
+  allowPositionals: true,
+});
+
+/**
+ * Fetches all user tables from the database
+ */
+async function getAllTables(): Promise<string[]> {
+  const tables = await db.all<TableInfo>(sql`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table'
+      AND name NOT LIKE 'sqlite_%'
+      AND name NOT LIKE '__drizzle%'
+    ORDER BY name
+  `);
+  return tables.map((t) => t.name);
+}
+
+/**
+ * Checks if sqlite_sequence table exists
+ */
+async function hasSequenceTable(): Promise<boolean> {
+  const result = await db.all<TableInfo>(sql`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name = 'sqlite_sequence'
+  `);
+  return result.length > 0;
+}
+
+/**
+ * Filters table names based on user input
+ */
+function filterTables(allTables: string[], requestedTables?: string): string[] {
+  if (!requestedTables) {
+    return allTables;
+  }
+
+  const requested = requestedTables
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const filtered = requested.filter((t) => allTables.includes(t));
+
+  // Warn about non-existent tables
+  const notFound = requested.filter((t) => !allTables.includes(t));
+  if (notFound.length > 0) {
+    console.warn(`⚠️  Tables not found: ${notFound.join(', ')}\n`);
+  }
+
+  return filtered;
+}
+
+/**
+ * Prompts user for confirmation
+ */
+function confirmDeletion(): boolean {
+  const response = prompt('Are you sure? (yes/no): ');
+  return response?.toLowerCase() === 'yes';
+}
+
+/**
+ * Deletes data from specified tables
+ */
+async function deleteTables(tables: string[]): Promise<void> {
+  for (const tableName of tables) {
+    await db.run(sql.raw(`DELETE FROM "${tableName}"`));
+    console.log(`✓ Deleted from ${tableName}`);
+  }
+}
+
+/**
+ * Drops specified tables entirely
+ */
+async function dropTables(tables: string[]): Promise<void> {
+  for (const tableName of tables) {
+    await db.run(sql.raw(`DROP TABLE IF EXISTS "${tableName}"`));
+    console.log(`✓ Dropped ${tableName}`);
+  }
+}
+
+/**
+ * Resets autoincrement sequences
+ */
+async function resetSequences(): Promise<void> {
+  if (await hasSequenceTable()) {
+    await db.run(sql`DELETE FROM sqlite_sequence`);
+    console.log('\n✓ Reset autoincrement sequences');
+  }
+}
+
+/**
+ * Main cleanup function
+ */
+async function cleanup(): Promise<void> {
+  // Get all available tables
+  const allTables = await getAllTables();
+
+  if (allTables.length === 0) {
+    console.log('No tables found in database.');
+    process.exit(0);
+  }
+
+  // Filter to requested tables
+  const tablesToDelete = filterTables(allTables, values.tables);
+
+  if (tablesToDelete.length === 0) {
+    console.log('No tables to delete.');
+    process.exit(0);
+  }
+
+  // Show what will be deleted
+  console.log(`\n📋 Tables to ${values.drop ? 'drop' : 'delete'}:`);
+  for (const table of tablesToDelete) {
+    console.log(`   - ${table}`);
+  }
+  console.log();
+
+  // Handle dry run
+  if (values['dry-run']) {
+    console.log(
+      `🔍 DRY RUN - No ${values.drop ? 'tables will be dropped' : 'data will be deleted'}`
+    );
+    process.exit(0);
+  }
+
+  // Confirm deletion
+  if (!values.confirm) {
+    if (values.drop) {
+      console.log(
+        '⚠️  This will DROP the above tables entirely (schema and data)!'
+      );
+    } else {
+      console.log('⚠️  This will DELETE ALL DATA from the above tables!');
+    }
+    console.log('   Run with --confirm to skip this prompt\n');
+
+    if (!confirmDeletion()) {
+      console.log('Cancelled.');
+      process.exit(0);
+    }
+  }
+
+  console.log(`\n🗑️  ${values.drop ? 'Dropping tables' : 'Deleting data'}...\n`);
+
+  try {
+    // Disable foreign keys temporarily
+    await db.run(sql`PRAGMA foreign_keys = OFF`);
+
+    if (values.drop) {
+      // Drop tables entirely
+      await dropTables(tablesToDelete);
+    } else {
+      // Delete from tables
+      await deleteTables(tablesToDelete);
+
+      // Reset sequences (only when deleting, not when dropping)
+      await resetSequences();
+    }
+
+    // Re-enable foreign keys
+    await db.run(sql`PRAGMA foreign_keys = ON`);
+
+    console.log('\n✅ Cleanup complete!');
+    console.log(
+      `   Tables ${values.drop ? 'dropped' : 'cleaned'}: ${tablesToDelete.length}`
+    );
+  } catch (error) {
+    console.error('\n❌ Error during cleanup:', error);
+
+    // Ensure foreign keys are re-enabled even on error
+    try {
+      await db.run(sql`PRAGMA foreign_keys = ON`);
+    } catch (fkError) {
+      console.error('Failed to re-enable foreign keys:', fkError);
+    }
+
+    process.exit(1);
+  }
+}
+
+// Run the cleanup
+cleanup().catch((error) => {
+  console.error('Unexpected error:', error);
+  process.exit(1);
+});
